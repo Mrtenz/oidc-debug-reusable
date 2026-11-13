@@ -1,0 +1,114 @@
+name: OIDC debug (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        type: string
+        required: true
+      environment:
+        type: string
+        required: false
+        default: ''
+
+jobs:
+  debug:
+    name: Debug OIDC publish
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PACKAGE: ${{ inputs.package }}
+    steps:
+      - name: Check OIDC environment and token exchange
+        run: |
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL set: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}"
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN set: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}"
+          echo "CI=${CI:-} GITHUB_ACTIONS=${GITHUB_ACTIONS:-}"
+
+          if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+            echo "::error::No OIDC request URL; id-token: write did not reach this job"
+            exit 1
+          fi
+
+          id_token="$(curl -sS \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=npm:registry.npmjs.org" \
+            | jq --raw-output '.value')"
+          echo "::add-mask::${id_token}"
+
+          payload="$(cut -d. -f2 <<< "${id_token}" | tr '_-' '/+')"
+          while (( ${#payload} % 4 )); do payload+="="; done
+          echo "ID token claims:"
+          base64 -d <<< "${payload}" \
+            | jq '{sub, repository, workflow_ref, job_workflow_ref, environment, ref, event_name}'
+
+          encoded_package="${PACKAGE/\//%2f}"
+          status="$(curl -sS \
+            -o exchange.json \
+            -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer ${id_token}" \
+            "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/${encoded_package}")"
+          echo "Exchange HTTP status: ${status}"
+          # Drop the token itself so it never reaches the log.
+          jq 'del(.token)' exchange.json || cat exchange.json
+          rm exchange.json
+
+      - name: Publish with Yarn
+        run: |
+          mkdir test-package
+          cd test-package
+          jq -n \
+            --arg name "${PACKAGE}" \
+            --arg version "0.0.0-test.${GITHUB_RUN_ID}" \
+            '{name: $name, version: $version, packageManager: "yarn@4.17.1", publishConfig: {access: "public"}}' \
+            > package.json
+          touch yarn.lock
+          corepack enable
+          yarn install --no-immutable
+          yarn npm publish --tag test
+        env:
+          YARN_NPM_REGISTRY_SERVER: 'https://registry.npmjs.org'
+
+      - name: Publish with Yarn via workspaces foreach
+        run: |
+          mkdir test-monorepo-1
+          cd test-monorepo-1
+          mkdir -p packages/test
+          jq -n '{name: "root", version: "0.0.0", private: true, workspaces: ["packages/*"], packageManager: "yarn@4.17.1"}' > package.json
+          jq -n \
+            --arg name "${PACKAGE}" \
+            --arg version "0.0.0-test.${GITHUB_RUN_ID}.1" \
+            '{name: $name, version: $version, publishConfig: {access: "public"}}' \
+            > packages/test/package.json
+          touch yarn.lock
+          yarn install --no-immutable
+          yarn workspaces foreach --no-private --all exec yarn npm publish --tag test
+        env:
+          YARN_NPM_REGISTRY_SERVER: 'https://registry.npmjs.org'
+
+      - name: Publish with release-tools .yarnrc.yml and sanitise step
+        run: |
+          mkdir test-monorepo-2
+          cd test-monorepo-2
+          mkdir -p packages/test
+          jq -n '{name: "root", version: "0.0.0", private: true, workspaces: ["packages/*"], packageManager: "yarn@4.17.1"}' > package.json
+          jq -n \
+            --arg name "${PACKAGE}" \
+            --arg version "0.0.0-test.${GITHUB_RUN_ID}.2" \
+            '{name: $name, version: $version, publishConfig: {access: "public"}}' \
+            > packages/test/package.json
+          touch yarn.lock
+          curl -sSf https://raw.githubusercontent.com/MetaMask/release-tools/main/.yarnrc.yml -o .yarnrc.yml
+          # The plugin file is not available in this throwaway project.
+          yq -i 'del(.plugins)' .yarnrc.yml
+          yarn install --no-immutable
+          # Same registry stripping as the real sanitise step.
+          yq -i 'del(.npmRegistryServer) | del(.npmPublishRegistry) | del(.npmScopes)' .yarnrc.yml
+          cat .yarnrc.yml
+          yarn workspaces foreach --no-private --all exec yarn npm publish --tag test
+        env:
+          YARN_NPM_REGISTRY_SERVER: 'https://registry.npmjs.org'
